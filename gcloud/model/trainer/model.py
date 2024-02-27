@@ -1,133 +1,177 @@
+import tempfile
+import warnings
+
+# suppress PerformanceWarning
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
+
 import numpy as np
 import pandas as pd
+
 from numpy import linalg as la
+from sklearn import metrics
 from scipy.spatial.distance import mahalanobis
 from keras.layers import RepeatVector
 from keras.callbacks import EarlyStopping
 from tensorflow import keras
 from tensorflow.keras import layers
 from filterpy.kalman import unscented_transform, JulierSigmaPoints
-import tempfile
-import warnings
-from .__init__ import __init__
-
-warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
-
-def nearestPD(A):
-
-    """
-    adapted from https://stackoverflow.com/questions/43238173/python-convert-matrix-to-positive-semi-definite
-
-    Find the nearest positive-definite matrix to input
-
-    A Python/Numpy port of John D'Errico's `nearestSPD` MATLAB code [1], which
-    credits [2].
-
-    [1] https://www.mathworks.com/matlabcentral/fileexchange/42885-nearestspd
-
-    [2] N.J. Higham, "Computing a nearest symmetric positive semidefinite
-    matrix" (1988): https://doi.org/10.1016/0024-3795(88)90223-6
-    """
-
-    B = (A + A.T) / 2
-    _, s, V = la.svd(B)
-
-    H = np.dot(V.T, np.dot(np.diag(s), V))
-
-    A2 = (B + H) / 2
-
-    A3 = (A2 + A2.T) / 2
-
-    if isPD(A3):
-        return A3
-
-    spacing = np.spacing(la.norm(A))
-    # The above is different from [1]. It appears that MATLAB's `chol` Cholesky
-    # decomposition will accept matrixes with exactly 0-eigenvalue, whereas
-    # Numpy's will not. So where [1] uses `eps(mineig)` (where `eps` is Matlab
-    # for `np.spacing`), we use the above definition. CAVEAT: our `spacing`
-    # will be much larger than [1]'s `eps(mineig)`, since `mineig` is usually on
-    # the order of 1e-16, and `eps(1e-16)` is on the order of 1e-34, whereas
-    # `spacing` will, for Gaussian random matrixes of small dimension, be on
-    # othe order of 1e-16. In practice, both ways converge, as the unit test
-    # below suggests.
-    I = np.eye(A.shape[0])
-    k = 1
-    while not isPD(A3):
-        mineig = np.min(np.real(la.eigvals(A3)))
-        A3 += I * (-mineig * k**2 + spacing)
-        k += 1
-
-    # np.fill_diagonal(A3, np.maximum(A3.diagonal(), 1e-6))
-    return A3
 
 
-def isPD(B):
-
-    """Returns true when input is positive-definite, via Cholesky"""
-    try:
-        _ = la.cholesky(B)
-        return True
-    except la.LinAlgError:
-        return False
-
-
-def _calc_point2point(predict, actual):
-
-    """
-    calculate f1 score by predict and actual.
-
-    Args:
-        predict (np.ndarray): the predict label
-        actual (np.ndarray): np.ndarray
-    """
-    predict = np.array(predict)
-    actual = np.array(actual)
-
-    TP = np.sum(predict * actual)
-    TN = np.sum((1 - predict) * (1 - actual))
-    FP = np.sum(predict * (1 - actual))
-    FN = np.sum((1 - predict) * actual)
-    precision = TP / (TP + FP + 0.00001)
-    recall = TP / (TP + FN + 0.00001)
-    f1 = 2 * precision * recall / (precision + recall + 0.00001)
-    return f1, precision, recall, TP, TN, FP, FN
-
-
-def f_search(score, label):
-    """
-    Find the best-f1 score by searching best `threshold` in [`start`, `end`).
-
-    Returns:
-        list: list for results
-        float: the `threshold` for best-f1
-    """
-
-    m = [-1] * 7
-    m_t = 0.0
-    sorted_score = np.sort(np.unique(score))
-    for threshold in sorted_score:
-        score_ = score.copy()
-        score_[score_ <= threshold] = 0
-        score_[score_ > threshold] = 1
-        target = _calc_point2point(score_, label)
-        if target[0] > m[0]:
-            m_t = threshold
-            m = target
-
-    return m, m_t
-
-class BDM:
+class Model:
     '''
     Bidirectional dynamic model
     :param u_length: the length of input sequence for covariate encoder
     :param x_length: the number of time points for stacking sensor measurements
     '''
+    xl = None
+    ul = None
+    epochs = None
+    batch_size = None
+    s_dim = None
+    s_activation = None
+    validation_split = None
+    verbose = None
+    freq = 1
+    label = None
+    output_dir = None
+    normalization = 'standard'
+    signal_variables = []
+    control_variables = []
+
+    @staticmethod
+    def nearestPD(A):
+        """
+        adapted from https://stackoverflow.com/questions/43238173/python-convert-matrix-to-positive-semi-definite
+
+        Find the nearest positive-definite matrix to input
+
+        A Python/Numpy port of John D'Errico's `nearestSPD` MATLAB code [1], which
+        credits [2].
+
+        [1] https://www.mathworks.com/matlabcentral/fileexchange/42885-nearestspd
+
+        [2] N.J. Higham, "Computing a nearest symmetric positive semidefinite
+        matrix" (1988): https://doi.org/10.1016/0024-3795(88)90223-6
+        """
+        B = (A + A.T) / 2
+        _, s, V = la.svd(B)
+
+        H = np.dot(V.T, np.dot(np.diag(s), V))
+
+        A2 = (B + H) / 2
+
+        A3 = (A2 + A2.T) / 2
+
+        if Model.isPD(A3):
+            return A3
+
+        spacing = np.spacing(la.norm(A))
+        # The above is different from [1]. It appears that MATLAB's `chol` Cholesky
+        # decomposition will accept matrixes with exactly 0-eigenvalue, whereas
+        # Numpy's will not. So where [1] uses `eps(mineig)` (where `eps` is Matlab
+        # for `np.spacing`), we use the above definition. CAVEAT: our `spacing`
+        # will be much larger than [1]'s `eps(mineig)`, since `mineig` is usually on
+        # the order of 1e-16, and `eps(1e-16)` is on the order of 1e-34, whereas
+        # `spacing` will, for Gaussian random matrixes of small dimension, be on
+        # othe order of 1e-16. In practice, both ways converge, as the unit test
+        # below suggests.
+        I = np.eye(A.shape[0])
+        k = 1
+        while not Model.isPD(A3):
+            mineig = np.min(np.real(la.eigvals(A3)))
+            A3 += I * (-mineig * k**2 + spacing)
+            k += 1
+
+        # np.fill_diagonal(A3, np.maximum(A3.diagonal(), 1e-6))
+        return A3
 
 
+    @staticmethod
+    def isPD(B):
 
-    def prepare_data(self, df_data, signal_variables, control_variables, dict_continuous_variables,
-                     dict_discrete_variables, label=None, freq=1, normalization='standard'):
+        """Returns true when input is positive-definite, via Cholesky"""
+        try:
+            _ = la.cholesky(B)
+            return True
+        except la.LinAlgError:
+            return False
+
+
+    @staticmethod
+    def _calc_point2point(predict, actual):
+        """
+        calculate f1 score by predict and actual.
+
+        Args:
+            predict (np.ndarray): the predict label
+            actual (np.ndarray): np.ndarray
+        """
+        predict = np.array(predict)
+        actual = np.array(actual)
+
+        TP = np.sum(predict * actual)
+        TN = np.sum((1 - predict) * (1 - actual))
+        FP = np.sum(predict * (1 - actual))
+        FN = np.sum((1 - predict) * actual)
+        precision = TP / (TP + FP + 0.00001)
+        recall = TP / (TP + FN + 0.00001)
+        f1 = 2 * precision * recall / (precision + recall + 0.00001)
+        return f1, precision, recall, TP, TN, FP, FN
+
+
+    @staticmethod
+    def f_search(score, label):
+        """
+        Find the best-f1 score by searching best `threshold` in [`start`, `end`).
+
+        Returns:
+            list: list for results
+            float: the `threshold` for best-f1
+        """
+        m = [-1] * 7
+        m_t = 0.0
+        sorted_score = np.sort(np.unique(score))
+        for threshold in sorted_score:
+            score_ = score.copy()
+            score_[score_ <= threshold] = 0
+            score_[score_ > threshold] = 1
+            target = Model._calc_point2point(score_, label)
+            if target[0] > m[0]:
+                m_t = threshold
+                m = target
+
+        return m, m_t
+    
+
+    def __init__(self):
+        pass
+
+
+    def _form_variables_dicts(self, x):
+        dict_continuous_variables, dict_discrete_variables = {}, {}
+
+        if self.normalization == 'min-max':
+
+            for signal in self.signal_variables:
+                dict_continuous_variables.update(
+                    {
+                        signal: {
+                            'mean': x[signal].mean(), 
+                            'std': x[signal].std(),
+                            'max': x[signal].max(), 
+                            'min': x[signal].min()
+                        }
+                    }
+                )
+
+        for control in self.control_variables.copy():
+            unique_vals = np.unique(x[control])
+            dict_discrete_variables.update({control: unique_vals})
+
+        return dict_continuous_variables, dict_discrete_variables
+
+
+    def _prepare_data(self, df_data, signal_variables, control_variables, dict_continuous_variables, dict_discrete_variables, label=None, freq=1, normalization='standard'):
         """
         :param df: data frame containing signals and controls
         :param signal_variables:  list of columns corresponding to signals
@@ -139,14 +183,12 @@ class BDM:
         :param label: column name of the labels; note there should be only one label column, with 0 indicating normal samples, 1 indicating abnormal samples
         :return: previous, current, and next signal sequences, and current controls sequence, and labels
         """
-
+        
         continuous_variables = sorted(list(dict_continuous_variables.keys()))
         discrete_variables = sorted(list(dict_discrete_variables.keys()))
         df = df_data.copy()
-        assert set(signal_variables + control_variables + discrete_variables + continuous_variables).issubset(
-            set(df.columns)), "variables should correspond to column names!"
-        assert set(signal_variables).intersection(
-            set(discrete_variables)) == set(), "signals variables should all be continuous!"
+        assert set(signal_variables + control_variables + discrete_variables + continuous_variables).issubset(set(df.columns)), "variables should correspond to column names!"
+        assert set(signal_variables).intersection(set(discrete_variables)) == set(), "signals variables should all be continuous!"
 
         # normalization #
         if normalization is not None:
@@ -155,11 +197,11 @@ class BDM:
                 if normalization == 'min-max':
                     v_min = dict_continuous_variables[v]['min']
                     v_max = dict_continuous_variables[v]['max']
-                    df[v] = (df[v] - v_min) / float(v_max - v_min + 1e-8)
+                    df[v] = (df[v] - v_min)/float(v_max - v_min + 1e-8)
                 if normalization == 'standard':
                     v_mean = dict_continuous_variables[v]['mean']
                     v_std = dict_continuous_variables[v]['std']
-                    df[v] = (df[v] - v_mean) / float(v_std + 1e-8)
+                    df[v] = (df[v] - v_mean)/float(v_std + 1e-8)
 
         df_signals = pd.DataFrame()
         df_controls = pd.DataFrame()
@@ -181,7 +223,7 @@ class BDM:
             _df.columns = ['xc_' + name + ' + ' + str(i) for name in df_signals.columns]
             _x_curr.append(_df)
 
-            if label is not None:  # if any of the sequence observations is anomaly, declare as anomaly #
+            if label is not None:    # if any of the sequence observations is anomaly, declare as anomaly #
                 df[label] = np.maximum(df_data[label], df_data[label].shift(-i))
         df_xcurr = pd.concat(_x_curr, axis=1)
 
@@ -226,6 +268,53 @@ class BDM:
         else:
             return x_prev, x_curr, x_next, u_curr, df_full[label].values
 
+
+    def prepare_train_data(self, path):
+        train_df = pd.read_csv(path).dropna()
+
+        self.dict_discrete_variables, self.dict_continuous_variables = self._form_variables_dicts(
+            train_df)
+
+        x_prev, x_curr, x_next, u_curr, _ = self._prepare_data(
+            train_df,
+            signal_variables=self.signal_variables,
+            control_variables=self.control_variables,
+            dict_continuous_variables=self.dict_continuous_variables,
+            dict_discrete_variables=self.dict_discrete_variables,
+            label=None,
+            normalization=self.normalization,
+            freq=self.freq
+        )
+
+        x_dim = int(x_curr.shape[1]/self.xl)
+        index = np.arange(len(x_prev))
+        train_pos = index[:(len(x_prev) * 3 // 4)]
+        val_pos = index[(len(x_prev) * 3 // 4):]
+
+        x_train = [x_prev[train_pos, :], x_curr[train_pos, :], x_next[train_pos, :], u_curr[train_pos, :]]
+        x_val = [x_prev[val_pos, :], x_curr[val_pos, :], x_next[val_pos, :], u_curr[val_pos, :]]
+
+        return x_train, x_val
+
+
+    def prepare_test_data(self, path):
+        test_df = pd.read_csv(path).dropna()
+        test_df.loc[test_df['label'] >= 1, 'label'] = 1
+
+        _, x_test, x_next, u_test, labels = self.prepare_data(
+            test_df,
+            signal_variables=self.signal_variables,
+            control_variables=self.control_variables,
+            dict_continuous_variables=self.dict_continuous_variables,
+            dict_discrete_variables=self.dict_discrete_variables,
+            label=self.label,
+            normalization=self.normalization,
+            freq=self.xl
+        )
+
+        return x_test, u_test, labels
+
+
     def _make_network(self, x_dim, u_dim, s_dim, hid_dim, e_nlayers, d_nlayerss, f_nlayers, s_activation):
 
         s = keras.Input(shape=s_dim)
@@ -261,14 +350,13 @@ class BDM:
 
         # forward/backward transition #
         u_bidirection = layers.Bidirectional(layers.LSTM(hid_dim, return_sequences=True))(u)
-        u_forward, u_backward = layers.Bidirectional(
-            layers.LSTM(s_dim, return_sequences=False, activation=s_activation), merge_mode=None)(u_bidirection)
+        u_forward, u_backward = layers.Bidirectional(layers.LSTM(s_dim, return_sequences=False, activation=s_activation), merge_mode=None)(u_bidirection)
         f = layers.Dense(hid_dim, activation='relu')(s)
-        for _ in range(f_nlayers - 1):
+        for _ in range(f_nlayers-1):
             f = layers.Dense(hid_dim, activation='relu')(f)
         f = layers.Dense(s_dim, activation=s_activation)(f)
-        f_forward = (f + u_forward) / 2
-        f_backward = (f + u_backward) / 2
+        f_forward = (f + u_forward)/2
+        f_backward = (f + u_backward)/2
 
         f_net = keras.Model(inputs=[u, s], outputs=f_forward)
         b_net = keras.Model(inputs=[u, s], outputs=f_backward)
@@ -286,7 +374,8 @@ class BDM:
         model = keras.Model([xseq_prev, xseq_curr, xseq_next, u], [xhat_prev, xhat_curr, xhat_next, s1_, s2_, s_])
         return model, e_net, d_net, f_net, b_net
 
-    def train(self, x, s_dim=4, hid_dim=4, e_nlayers=1, d_nlayerss=1, f_nlayers=1, s_activation='tanh',
+
+    def _train(self, x, s_dim=4, hid_dim=4, e_nlayers=1, d_nlayerss=1, f_nlayers=1, s_activation='tanh',
               optimizer='adam', batch_size=64, epochs=100, validation_split=0.1, verbose=1, best_model=True):
 
         """
@@ -295,7 +384,7 @@ class BDM:
         """
 
         n = len(x[0])
-        x_dim = int(x[0].shape[1] / self.xl)
+        x_dim = int(x[0].shape[1]/self.xl)
         u_dim = x[3].shape[2]
         y = x[:3]
         x[0] = x[0].reshape(n, self.xl, x_dim)
@@ -303,18 +392,15 @@ class BDM:
         x[2] = x[2].reshape(n, self.xl, x_dim)
 
         keras.backend.clear_session()
-        model, e_net, d_net, f_net, b_net = self._make_network(x_dim, u_dim, s_dim, hid_dim, e_nlayers, d_nlayerss,
-                                                               f_nlayers, s_activation)
+        model, e_net, d_net, f_net, b_net = self._make_network(x_dim, u_dim, s_dim, hid_dim, e_nlayers, d_nlayerss, f_nlayers, s_activation)
         s_ = np.zeros((n, s_dim))
         model.compile(loss=['mse', 'mse', 'mse', 'mse', 'mse', 'mse'], loss_weights=[1, 1, 1, 0.1, 0.1, 0.1])
 
         if best_model:
             early_stopping = EarlyStopping(monitor='val_loss', mode='auto', patience=epochs, restore_best_weights=True)
-            model.fit(x, y + [s_] * 3, batch_size=batch_size, epochs=epochs, validation_split=validation_split,
-                      verbose=verbose, callbacks=[early_stopping])
+            model.fit(x, y + [s_] * 3, batch_size=batch_size, epochs=epochs, validation_split=validation_split, verbose=verbose, callbacks=[early_stopping])
         else:
-            model.fit(x, y + [s_] * 3, batch_size=batch_size, epochs=epochs, validation_split=validation_split,
-                      verbose=verbose)
+            model.fit(x, y + [s_] * 3, batch_size=batch_size, epochs=epochs, validation_split=validation_split, verbose=verbose)
 
         e_net.compile(optimizer=optimizer, loss='mse')
         self.e_net = e_net
@@ -327,6 +413,26 @@ class BDM:
         self.model = model
 
         return self
+    
+
+    def train_model_with_estimation(self, x_train, x_val):
+
+        self.train(
+            x_train,
+            s_dim=self.s_dim,
+            s_activation=self.s_activation,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            validation_split=self.validation_split,
+            verbose=self.verbose
+        )
+
+        self.estimate_system(x_val)
+
+        self.save_model(self.output_dir) 
+
+        return
+
 
     def estimate_system(self, x):
         """
@@ -334,7 +440,7 @@ class BDM:
         return: reconstruction error, forward/backward transition error, mean and covariance of states
         """
 
-        x_dim = int(x[0].shape[1] / self.xl)
+        x_dim = int(x[0].shape[1]/self.xl)
         x_prev = x[0].reshape(x[0].shape[0], self.xl, x_dim)
         x_curr = x[1].reshape(x[1].shape[0], self.xl, x_dim)
         x_next = x[2].reshape(x[2].shape[0], self.xl, x_dim)
@@ -356,6 +462,7 @@ class BDM:
 
         return self
 
+
     def _filter(self, x_t, u_t, direction):
 
         '''
@@ -370,10 +477,10 @@ class BDM:
             trans_fun = self.b_net.predict
             Q = self.Qb
         else:
-            raise ('direction must be forward or backward !')
+            raise('direction must be forward or backward !')
 
         points = JulierSigmaPoints(n=len(self.s), kappa=3 - len(self.s))
-        sigmas = points.sigma_points(self.s, nearestPD(self.P))
+        sigmas = points.sigma_points(self.s, Model.nearestPD(self.P))
 
         sigmas_trans = trans_fun([np.array([u_t] * len(sigmas)), sigmas])
         sigmas_d = self.d_net.predict(sigmas_trans)
@@ -384,13 +491,12 @@ class BDM:
             x_inv_cov = np.linalg.inv(x_cov)
         except:
             x_inv_cov = np.linalg.pinv(x_cov)
-        KG = np.dot(
-            np.sum([points.Wc[i] * np.outer(sigmas_trans[i] - s_hat, sigmas_d[i] - x_mu) for i in range(len(sigmas))],
-                   0), x_inv_cov)
+        KG = np.dot(np.sum([points.Wc[i] * np.outer(sigmas_trans[i] - s_hat, sigmas_d[i] - x_mu) for i in range(len(sigmas))], 0), x_inv_cov)
         self.s = s_hat + np.dot(KG, x_t.flatten() - x_mu.flatten())
         self.P = P_hat - np.dot(KG, x_cov).dot(np.transpose(KG))
 
         return x_mu, x_inv_cov, self.s, self.P
+
 
     def filter(self, x, u, smoothing=False, n_lag=None):
         """
@@ -399,7 +505,7 @@ class BDM:
         :return: forward/backward anomaly scores, filtering/smoothing state estimates
         """
         n = x.shape[0]
-        x_dim = int(x.shape[1] / self.xl)
+        x_dim = int(x.shape[1]/self.xl)
         x = x.reshape(n, self.xl, x_dim)
         self.s = self.e_net.predict(np.array([x[0]]))[0]
         self.P = np.diag([1e-6] * len(self.s))
@@ -426,7 +532,7 @@ class BDM:
                 x_t = x[t, :]
 
                 if (n_lag is not None) and (t % n_lag == 0):
-                    self.s = s_mu_forward[t]  # corresponds to u_t
+                    self.s = s_mu_forward[t]   # corresponds to u_t
                     self.P = s_cov_forward[t]
 
                 x_mu, x_inv_cov, s_mu, s_cov = self._filter(x_t, u_t, direction='backward')
@@ -441,15 +547,35 @@ class BDM:
 
             return np.array(scores_forward), np.array(scores_backward), np.array(s_mu_forward), np.array(s_mu_backward)
 
+
     def test(self, x, u):
         x_dim = int(x.shape[1] / self.xl)
         x = x.reshape(x.shape[0], self.xl, x_dim)
         s = self.e_net.predict(x)
         s_next_pred = self.f_net.predict([u, s])
         x_hat = self.d_net.predict(s_next_pred)
-        scores = np.array(
-            [mahalanobis(x[t + 1].flatten(), x_hat[t], np.linalg.inv(self.Rf)) for t in range(len(x) - 1)])
+        scores = np.array([mahalanobis(x[t + 1].flatten(), x_hat[t], np.linalg.inv(self.Rf)) for t in range(len(x) - 1)])
         return scores
+    
+
+    def test_and_evaluate(self, x, u, labels):
+        z_scores_bdm = self.test(x, u)
+        z_scores_bdm = np.nan_to_num(z_scores_bdm)
+        t, _ = self.f_search(z_scores_bdm, labels[1:])
+
+        print('BDM')
+        print('best-f1', t[0])
+        print('precision', t[1])
+        print('recall', t[2])
+        print('accuracy', (t[3] + t[4]) / (t[3] + t[4] + t[5] + t[6]))
+        print('TP', t[3])
+        print('TN', t[4])
+        print('FP', t[5])
+        print('FN', t[6])
+        print('AUC:', metrics.roc_auc_score(labels[1:], z_scores_bdm))
+
+        return
+    
 
     def save_model(self, path):
         if path is None:
