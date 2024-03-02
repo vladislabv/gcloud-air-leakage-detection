@@ -9,6 +9,9 @@ __pycache__/
 # Raw data files
 data/
 
+# Gcloud CLI
+google-cloud-sdk/
+
 # Distribution / packaging
 .Python
 build/

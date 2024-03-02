@@ -11,7 +11,7 @@ REQUIRED_PACKAGES = [
 ]
 
 setup(
-  name='my-package',
+  name='src',
   version='0.1',
   author = 'Vladislav Stasenko',
   author_email = 'vladislav.stasenko@fh-swf.de',
